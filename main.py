@@ -1,38 +1,46 @@
-from fastapi import FastAPI, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-import numpy as np
-import joblib
+import pickle
+import io
 
 app = FastAPI()
 
-# Load saved components
-rf_model = joblib.load("rf_model.pkl")
-imputer = joblib.load("imputer.pkl")
-feature_columns = joblib.load("feature_columns.pkl")
+# Enable CORS for frontend/mobile integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load model artifacts
+with open("model.pkl", "rb") as f:
+    model = pickle.load(f)
+
+with open("imputer.pkl", "rb") as f:
+    imputer = pickle.load(f)
+
+with open("feature_columns.pkl", "rb") as f:
+    feature_columns = pickle.load(f)
 
 @app.post("/predict")
-async def predict(file: UploadFile):
-    try:
-        # Load Excel file
-        df = pd.read_excel(file.file)
-        df.replace("?", pd.NA, inplace=True)
+async def predict(file: UploadFile = File(...)):
+    contents = await file.read()
+    df = pd.read_excel(io.BytesIO(contents))
 
-        # One-hot encode and align columns
-        df = pd.get_dummies(df, drop_first=True)
-        df = df.reindex(columns=feature_columns, fill_value=0)
+    # Select and preprocess features
+    df = df[feature_columns]
+    df_imputed = pd.DataFrame(imputer.transform(df), columns=feature_columns)
 
-        # Impute missing values
-        X = imputer.transform(df)
+    # Predict probabilities
+    predictions = model.predict_proba(df_imputed)[:, 1]
+    risk_labels = ["High Risk" if p > 0.7 else "Low Risk" for p in predictions]
 
-        # Predict autism probabilities
-        probs = rf_model.predict_proba(X)[:, 1]
-        results = pd.DataFrame({
-            "Autism Probability (%)": (probs * 100).round(2),
-            "Risk Level": ["High Risk" if prob >= 80 else "Low/Moderate Risk" for prob in (probs * 100)]
-        })
+    # Return results
+    result_df = df.copy()
+    result_df["Autism Probability"] = predictions
+    result_df["Risk Level"] = risk_labels
 
-        return JSONResponse(content=results.to_dict(orient="records"))
-
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+    return result_df.to_dict(orient="records")
